@@ -1577,7 +1577,7 @@ with _tc1:
         max_value=600,
         value=100,
         step=1,
-        help="Target annual ROE uplift in basis points (bp). The model first allocates donor capacity to meet this ROE target (via profit-generating redeployment) and then allocates additional capacity to meet the CET1-uplift target.",
+        help="Target annual ROE uplift in basis points (bp). The model first allocates donor capacity to meet this ROE target (via profit-generating redeployment) and then allocates additional capacity to meet the CET1-uplift target. Caution: The fee-income from the assets/ RWAs left \"free\" to meet the CET1-uplift, represents an implicit floor for ROE-uplift.",
         key="roe_target_slider",
     )
 
