@@ -680,8 +680,8 @@ def compute_max_roe_uplift_map(
 
         sim_df_max = sim_df.copy()
         # Oversize the RWA reduction targets so the allocator becomes capacity-constrained.
-        sim_df_max["Effective_RWA_Reduction_EUR_bn_Tot"] = 1e12
-        sim_df_max["Gross_RWA_Offload_EUR_bn_Tot"] = 1e12
+        sim_df_max["Effective_RWA_Reduction_EUR_bn_Yr"] = 1e12
+        sim_df_max["Gross_RWA_Offload_EUR_bn_Yr"] = 1e12
 
         roe_df_maxcap = compute_roe_delta_transitions_greedy(
             sim_df_max,
@@ -730,10 +730,12 @@ def rwa_to_assets(rwa_eur_bn: float, rwa_density_pct: float) -> float:
     return float(rwa_eur_bn) / density
 
 
-def simulate_offload(years: int, banks_df: pd.DataFrame, scenarios_bps: dict, srt_efficiencies: List[float]) -> pd.DataFrame:
+def simulate_offload(banks_df: pd.DataFrame, scenarios_bps: dict, srt_efficiencies: List[float]) -> pd.DataFrame:
     """
-    Per-bank version of the 'simple offload' module.
+    Per-bank version of the 'simple offload' module in **steady-state / annual** terms.
+
     Assumes CET1 capital is fixed: C = CET1_ratio * RWA.
+    Removes the time-horizon dimension: all outputs are annual end-state requirements.
     """
     rows = []
     for _, b in banks_df.iterrows():
@@ -756,9 +758,7 @@ def simulate_offload(years: int, banks_df: pd.DataFrame, scenarios_bps: dict, sr
                 gross_rwa = (eff_red / eff) if (eff > 0 and np.isfinite(eff_red)) else np.nan
                 share = (gross_rwa / R) if (R > 0 and np.isfinite(gross_rwa)) else np.nan
 
-                ann_rwa = gross_rwa / years if np.isfinite(gross_rwa) else np.nan
                 gross_ast = rwa_to_assets(gross_rwa, d) if np.isfinite(gross_rwa) else np.nan
-                ann_ast = gross_ast / years if np.isfinite(gross_ast) else np.nan
 
                 rows.append({
                     "Bank": bank,
@@ -768,7 +768,6 @@ def simulate_offload(years: int, banks_df: pd.DataFrame, scenarios_bps: dict, sr
                     "Scenario": sc_name,
                     "US_CET1_Advantage_bps": float(adv_bps),
                     "SRT_Efficiency": f"{round(eff * 100):.0f}%",
-                    "Years": int(years),
 
                     "Current_CET1_Ratio_pct": round(cet1_ratio * 100, 2),
                     "Target_CET1_Ratio_pct": round(target * 100, 2),
@@ -777,16 +776,11 @@ def simulate_offload(years: int, banks_df: pd.DataFrame, scenarios_bps: dict, sr
                     "CET1_Capital_EUR_bn": round(C, 3),
                     "RWA_Density_pct": d,
 
-                    # Total (horizon)
-                    "Effective_RWA_Reduction_EUR_bn_Tot": round(eff_red, 3) if np.isfinite(eff_red) else np.nan,
-                    "Gross_RWA_Offload_EUR_bn_Tot": round(gross_rwa, 3) if np.isfinite(gross_rwa) else np.nan,
-                    "Gross_RWA_Offload_pct_of_RWA_Tot": round(share * 100, 3) if np.isfinite(share) else np.nan,
-                    "Gross_Assets_Offloaded_EUR_bn_Tot": round(gross_ast, 3) if np.isfinite(gross_ast) else np.nan,
-
-                    # Annualized
-                    "Gross_RWA_Offload_EUR_bn_Yr": round(ann_rwa, 3) if np.isfinite(ann_rwa) else np.nan,
-                    "Gross_RWA_Offload_pct_of_RWA_Yr": round((ann_rwa / R) * 100, 3) if (R > 0 and np.isfinite(ann_rwa)) else np.nan,
-                    "Gross_Assets_Offloaded_EUR_bn_Yr": round(ann_ast, 3) if np.isfinite(ann_ast) else np.nan,
+                    # Steady-state / annual requirements
+                    "Effective_RWA_Reduction_EUR_bn_Yr": round(eff_red, 3) if np.isfinite(eff_red) else np.nan,
+                    "Gross_RWA_Offload_EUR_bn_Yr": round(gross_rwa, 3) if np.isfinite(gross_rwa) else np.nan,
+                    "Gross_RWA_Offload_pct_of_RWA_Yr": round(share * 100, 3) if np.isfinite(share) else np.nan,
+                    "Gross_Assets_Offloaded_EUR_bn_Yr": round(gross_ast, 3) if np.isfinite(gross_ast) else np.nan,
                 })
 
     return pd.DataFrame(rows)
@@ -836,14 +830,12 @@ def compute_roe_delta_transitions_greedy(
         tx = float(override_tax_rate)
     # Annual RWA reduction target for the transition engine:
     # Use *effective* RWA reduction (as in the original version before the gross-target change).
-    gross = df["Gross_RWA_Offload_EUR_bn_Tot"].clip(lower=0)
+    gross = df["Gross_RWA_Offload_EUR_bn_Yr"].clip(lower=0)
 
     # Legacy lever term (gross/effective) kept so economics remain comparable
-    eff = df["Effective_RWA_Reduction_EUR_bn_Tot"].clip(lower=0)
+    eff = df["Effective_RWA_Reduction_EUR_bn_Yr"].clip(lower=0)
     df["gross_eff_lever"] = np.where(eff > 0, gross / eff, 1.0)
     lever_penalty = np.maximum(df["gross_eff_lever"] - 1.0, 0.0)
-
-    years = df["Years"].clip(lower=1)
     eff_per_year = eff.to_numpy(dtype=float)  # STEADY-STATE FLOW: annual RWA reduction target equals maintained CET1 end-state level (no / Years)
 
     # outputs
@@ -963,7 +955,7 @@ def compute_roe_delta_transitions_greedy(
         #   - upfront fee is annualised over the horizon
         gain_on_sale_dec = float(gain_on_sale_bps) / 10000.0
         servicing_dec = float(servicing_fee_bps) / 10000.0
-        origination_fee_dec_ann = (float(origination_fee_bps) / 10000.0) / max(float(row.get("Years", 1.0)), 1.0)
+        origination_fee_dec_ann = (float(origination_fee_bps) / 10000.0)
 
         struct_rate_dec = origination_fee_dec_ann + (sale_share_dec * (servicing_dec + gain_on_sale_dec))
         struct_rate_after_tax = struct_rate_dec * (1.0 - tx_i)
@@ -1239,7 +1231,6 @@ def compute_roe_delta_transitions_greedy(
                 "Bank": bank,
                 "Scenario": row["Scenario"],
                 "SRT_Efficiency": row["SRT_Efficiency"],
-                "Years": int(row["Years"]),
                 "Step": "REDEPLOY",
                 "RWA_target_base_EUR_bn_Yr": rwa_target_yr_base,
                 "RWA_target_redeploy_EUR_bn_Yr": rwa_target_redeploy_yr,
@@ -1262,7 +1253,6 @@ def compute_roe_delta_transitions_greedy(
                 "Bank": bank,
                 "Scenario": row["Scenario"],
                 "SRT_Efficiency": row["SRT_Efficiency"],
-                "Years": int(row["Years"]),
                 "Step": "CET1",
                 "RWA_target_base_EUR_bn_Yr": rwa_target_yr_base,
                 "RWA_target_redeploy_EUR_bn_Yr": rwa_target_redeploy_yr,
@@ -1309,7 +1299,7 @@ def compute_roe_delta_transitions_greedy(
 
     out = df[[
         "Bank", "Country", "Region", "Reporting Period",
-        "Scenario", "SRT_Efficiency", "Years",
+        "Scenario", "SRT_Efficiency",
         "CET1_Capital_EUR_bn",
         "RWA_reduction_achieved_Yr",
         "RWA_target_base_Yr",
@@ -1337,12 +1327,12 @@ def compute_sri(sim_df: pd.DataFrame, banks_df: pd.DataFrame) -> pd.DataFrame:
     df["Bank_Assets_Total"] = df["Bank"].map(assets_total)
     denom = df["Bank_Assets_Total"].clip(lower=1e-6)
 
-    df["SRI"] = np.round(100.0 * (df["Gross_Assets_Offloaded_EUR_bn_Tot"] / denom), 3)
+    df["SRI"] = np.round(100.0 * (df["Gross_Assets_Offloaded_EUR_bn_Yr"] / denom), 3)
 
     return df[[
         "Bank", "Country", "Region", "Reporting Period",
         "Scenario", "SRT_Efficiency",
-        "SRI", "Gross_Assets_Offloaded_EUR_bn_Tot", "Bank_Assets_Total"
+        "SRI", "Gross_Assets_Offloaded_EUR_bn_Yr", "Bank_Assets_Total"
     ]]
 
 
@@ -1570,20 +1560,9 @@ top_controls = _RoundRobinControls([_tc1, _tc2, _tc3])
 top_controls.header("Global Controls")
 
 with _tc1:
-    # Time horizon — moved above Scenario
-    years = st.slider(
-        "Time horizon (years)",
-        min_value=1,
-        max_value=10,
-        value=5,
-        step=1,
-    )
-
-    st.markdown("---")
-
     st.subheader("Scenario")
     scenario_bps = st.slider(
-        "CET1-uplift target (bp over horizon)",
+        "CET1-uplift target (bp p.a.)",
         min_value=0,
         max_value=400,
         value=168,
@@ -1657,8 +1636,8 @@ with _tc1:
     st.markdown("---")
     st.caption("Select one or more banks:")
 
-    # Defaults: prefer LBBW and Deutsche Bank if present; otherwise fall back to first bank
-    preferred_defaults = [b for b in ["LBBW", "Deutsche Bank"] if b in bank_list]
+    # Defaults: prefer LBBW and NordLB if present; otherwise fall back to first bank
+    preferred_defaults = [b for b in ["LBBW", "NordLB"] if b in bank_list]
     if not preferred_defaults and bank_list:
         preferred_defaults = [bank_list[0]]
 
@@ -1752,12 +1731,12 @@ with _tc2:
     )
 
     origination_fee_bps = st.slider(
-        "Upfront/origination fee (bps, one-off; annualised over horizon)",
+        "Upfront/origination fee (bps, one-off)",
         min_value=0,
         max_value= 300,
         value= 100,
         step=1,
-        help="One-off origination fee earned on all eligible (rolling) flow, whether sold or retained. The model annualises it over the chosen horizon.",
+        help="One-off origination fee earned on all eligible (rolling) flow, whether sold or retained. In steady-state, this is treated as an annual uplift on the eligible rolling flow.",
         key="origination_fee_bps_slider",
     )
 
@@ -1963,7 +1942,7 @@ effs = [round(float(sale_share) / 100.0, 6)]
 portfolio_df = make_portfolio_row(banks_sel)
 
 # Run model for portfolio
-sim_port = simulate_offload(years, portfolio_df, scenarios, effs)
+sim_port = simulate_offload( portfolio_df, scenarios, effs)
 roe_port = compute_roe_delta_transitions_greedy(
     sim_port,
     portfolio_df,
@@ -2005,12 +1984,12 @@ roe_port_base = compute_roe_delta_transitions_greedy(
 sri_port = compute_sri(sim_port, portfolio_df)
 
 # ---- Run model ----
-sim_df = simulate_offload(years, banks_sel, scenarios, effs)
+sim_df = simulate_offload( banks_sel, scenarios, effs)
 
 # --- Safety: guarantee transition-based offload columns exist (downstream reports expect them)
 for _c in [
-    'Assets_Offloaded_CET1_Transition_EUR_bn_Tot',
-    'Assets_Offloaded_ROE_Transition_EUR_bn_Tot',
+    'Assets_Offloaded_CET1_Transition_EUR_bn_Yr',
+    'Assets_Offloaded_ROE_Transition_EUR_bn_Yr',
 ]:
     if _c not in sim_df.columns:
         sim_df[_c] = 0.0
@@ -2050,13 +2029,12 @@ def _attach_transition_based_assets(sim: pd.DataFrame, roe: pd.DataFrame) -> pd.
            X_step = sum Exposure_used_EUR_bn_Yr
       2) Convert to offloaded assets using partner share p:
            Assets_offloaded_step = p * X_step
-      3) Annual -> total:
-           Assets_offloaded_step_Tot = Assets_offloaded_step_Yr * Years
+      3) (no time horizon): Assets_offloaded_step_EUR_bn_Yr is the steady-state annual amount
 
     Columns attached (EUR bn):
-      - Assets_Offloaded_ROE_Transition_EUR_bn_Yr / _Tot
-      - Assets_Offloaded_CET1_Transition_EUR_bn_Yr / _Tot
-      - Assets_Offloaded_Transition_EUR_bn_Yr / _Tot   (sum of both steps)
+      - Assets_Offloaded_ROE_Transition_EUR_bn_Yr 
+      - Assets_Offloaded_CET1_Transition_EUR_bn_Yr 
+      - Assets_Offloaded_Transition_EUR_bn_Yr    (sum of both steps)
 
     We also merge back endogenous scaling outputs from the ROE engine:
       - RWA_target_base_Yr
@@ -2067,11 +2045,11 @@ def _attach_transition_based_assets(sim: pd.DataFrame, roe: pd.DataFrame) -> pd.
 
     sim = sim.drop(columns=[
         "Assets_Offloaded_ROE_Transition_EUR_bn_Yr",
-        "Assets_Offloaded_ROE_Transition_EUR_bn_Tot",
+        "Assets_Offloaded_ROE_Transition_EUR_bn_Yr",
         "Assets_Offloaded_CET1_Transition_EUR_bn_Yr",
-        "Assets_Offloaded_CET1_Transition_EUR_bn_Tot",
+        "Assets_Offloaded_CET1_Transition_EUR_bn_Yr",
         "Assets_Offloaded_Transition_EUR_bn_Yr",
-        "Assets_Offloaded_Transition_EUR_bn_Tot",
+        "Assets_Offloaded_Transition_EUR_bn_Yr",
     ], errors="ignore")
 
     # ---- Optional alternative assets-offload measure (transition-based) ----
@@ -2085,11 +2063,11 @@ def _attach_transition_based_assets(sim: pd.DataFrame, roe: pd.DataFrame) -> pd.
         # No ROE / transition audit available -> keep schema stable with zeros
         for _c in [
             "Assets_Offloaded_ROE_Transition_EUR_bn_Yr",
-            "Assets_Offloaded_ROE_Transition_EUR_bn_Tot",
+            "Assets_Offloaded_ROE_Transition_EUR_bn_Yr",
             "Assets_Offloaded_CET1_Transition_EUR_bn_Yr",
-            "Assets_Offloaded_CET1_Transition_EUR_bn_Tot",
+            "Assets_Offloaded_CET1_Transition_EUR_bn_Yr",
             "Assets_Offloaded_Transition_EUR_bn_Yr",
-            "Assets_Offloaded_Transition_EUR_bn_Tot",
+            "Assets_Offloaded_Transition_EUR_bn_Yr",
         ]:
             if _c not in sim.columns:
                 sim[_c] = 0.0
@@ -2099,7 +2077,7 @@ def _attach_transition_based_assets(sim: pd.DataFrame, roe: pd.DataFrame) -> pd.
     if not isinstance(audit, pd.DataFrame) or audit.empty:
         return sim
 
-    key = ["Bank", "Scenario", "SRT_Efficiency", "Years"]
+    key = ["Bank", "Scenario", "SRT_Efficiency"]
 
     # Partner share from UI (percent -> decimal)
     try:
@@ -2136,12 +2114,6 @@ def _attach_transition_based_assets(sim: pd.DataFrame, roe: pd.DataFrame) -> pd.
         piv["Assets_Offloaded_ROE_Transition_EUR_bn_Yr"] + piv["Assets_Offloaded_CET1_Transition_EUR_bn_Yr"]
     )
 
-    piv["Years"] = piv["Years"].astype(float).clip(lower=1.0)
-
-    piv["Assets_Offloaded_ROE_Transition_EUR_bn_Tot"] = piv["Assets_Offloaded_ROE_Transition_EUR_bn_Yr"] * piv["Years"]
-    piv["Assets_Offloaded_CET1_Transition_EUR_bn_Tot"] = piv["Assets_Offloaded_CET1_Transition_EUR_bn_Yr"] * piv["Years"]
-    piv["Assets_Offloaded_Transition_EUR_bn_Tot"] = piv["Assets_Offloaded_Transition_EUR_bn_Yr"] * piv["Years"]
-
     # Merge scaling outputs (may be missing for base runs)
     scale_cols = ["RWA_target_base_Yr", "RWA_target_scaled_Yr", "RWA_target_scale"]
     for c in scale_cols:
@@ -2161,11 +2133,11 @@ def _attach_transition_based_assets(sim: pd.DataFrame, roe: pd.DataFrame) -> pd.
     # Fill NaNs
     for c in [
         "Assets_Offloaded_ROE_Transition_EUR_bn_Yr",
-        "Assets_Offloaded_ROE_Transition_EUR_bn_Tot",
+        "Assets_Offloaded_ROE_Transition_EUR_bn_Yr",
         "Assets_Offloaded_CET1_Transition_EUR_bn_Yr",
-        "Assets_Offloaded_CET1_Transition_EUR_bn_Tot",
+        "Assets_Offloaded_CET1_Transition_EUR_bn_Yr",
         "Assets_Offloaded_Transition_EUR_bn_Yr",
-        "Assets_Offloaded_Transition_EUR_bn_Tot",
+        "Assets_Offloaded_Transition_EUR_bn_Yr",
     ]:
         if c in sim.columns:
             sim[c] = sim[c].fillna(0.0)
@@ -2239,16 +2211,14 @@ with left_col:
         # Light-grey outline shows remaining headroom up to the max-capacity cap (Max. Reg. Divergence, bp).
 
         def _compute_cet1_target_df():
-            base_cols = [c for c in ["Scenario", "SRT_Efficiency", "Bank", "Years"] if c in sim_df.columns]
+            base_cols = [c for c in ["Scenario", "SRT_Efficiency", "Bank"] if c in sim_df.columns]
             base = sim_df[base_cols].drop_duplicates().copy()
-            if "Years" not in base.columns:
-                base["Years"] = float(years) if "years" in globals() else 1.0
             try:
                 tgt = float(scenario_bps)
             except Exception:
                 tgt = 0.0
             base["CET1_target_bp"] = tgt
-            return base[["Scenario", "SRT_Efficiency", "Bank", "Years", "CET1_target_bp"]]
+            return base[["Scenario", "SRT_Efficiency", "Bank", "CET1_target_bp"]]
 
         def _compute_max_reg_divergence_map_endstate():
             # In steady-state *flow* mode, donor sliders represent annual turnover.
@@ -2330,7 +2300,8 @@ with left_col:
             banks_in_df = df["Bank"].astype(str).dropna().unique().tolist()
 
             fig = go.Figure()
-            for bank in banks_in_df:
+            ordered_banks = [b for b in BANK_ORDER if b in banks_in_df] + [b for b in banks_in_df if b not in BANK_ORDER]
+            for _i, bank in enumerate(ordered_banks):
                 d = df[df["Bank"].astype(str).str.strip() == str(bank).strip()]
                 if d.empty:
                     continue
@@ -2351,8 +2322,7 @@ with left_col:
                         marker_color=color,
                         offsetgroup=bank,
                         legendgroup=bank,
-                        showlegend=True,
-                    )
+                        showlegend=True,                    )
                 )
 
                 fig.add_trace(
@@ -2385,8 +2355,7 @@ with left_col:
             fig.update_layout(
                 barmode="group",
                 title="CET1 uplift target (bp) – Banks (transition-based)",
-                legend_title_text="Bank",
-                legend_orientation="v",
+                legend_title_text="Bank",                legend_orientation="v",
                 legend_yanchor="top",
                 legend_y=1,
                 legend_xanchor="left",
@@ -2400,29 +2369,10 @@ with left_col:
     with top_right:
         st.subheader("2) ROE-Uplift")
 
-        # Two views: annual ΔROE (bp p.a.) vs cumulative over the horizon (bp * years)
-        tab_annual, tab_total = st.tabs(["Annual (bp p.a.)", "Total (bp over horizon)"])
-
-        # Prepare a working copy with a cumulative metric
-        roe_df_view = roe_df.copy()
-        if "Years" in roe_df_view.columns:
-            roe_df_view["ROE_delta_bp_Tot"] = roe_df_view["ROE_delta_bp"] * roe_df_view["Years"]
-        else:
-            # Fallback: if Years missing, treat total == annual (should not happen in normal runs)
-            roe_df_view["ROE_delta_bp_Tot"] = roe_df_view["ROE_delta_bp"]
-
-        # Portfolio average reference line uses a CET1-capital proxy weight
-        _w = banks_sel[["Bank Name", "Total RWA (EUR bn)", "CET1 Ratio (%)"]].copy()
-        _w["weight"] = _w["Total RWA (EUR bn)"] * _w["CET1 Ratio (%)"]
-
-        def _plot_roe(y_col: str, y_label: str, title: str):
-            _tmp = roe_df_view.merge(_w[["Bank Name", "weight"]], left_on="Bank", right_on="Bank Name", how="left")
-            _tmp = _tmp.dropna(subset=["weight"])
-
-            roe_port_avg = (
-                _tmp.groupby(["Scenario", "SRT_Efficiency"], as_index=False)
-                    .apply(lambda g: pd.Series({y_col: float(np.average(g[y_col], weights=g["weight"]))}))
-            )
+        # Annual view only (steady-state; no time horizon)
+        def _plot_roe_annual():
+            scenarios_order = roe_df["Scenario"].astype(str).dropna().unique().tolist()
+            fig = go.Figure()
 
             # --- Max-capacity ROE potential (outline) ---
             max_roe_map = compute_max_roe_uplift_map(
@@ -2439,37 +2389,19 @@ with left_col:
                 tol_pct=tol_pct,
             )
 
-            scenarios_order = roe_df_view["Scenario"].astype(str).dropna().unique().tolist()
-
-            fig = go.Figure()
-
-            for bank in BANK_ORDER:
-                d = roe_df_view[roe_df_view["Bank"] == bank]
+            for _i, bank in enumerate(BANK_ORDER):
+                d = roe_df[roe_df["Bank"] == bank]
                 if d.empty:
                     continue
 
-                cur_map = {str(r["Scenario"]): float(r.get(y_col, 0.0) or 0.0) for _, r in d.iterrows()}
+                cur_map = {str(r["Scenario"]): float(r.get("ROE_delta_bp", 0.0) or 0.0) for _, r in d.iterrows()}
                 cur_vals = [cur_map.get(str(sc), 0.0) for sc in scenarios_order]
 
-                # Potential is computed as (max - current), clipped at 0.
-                max_ann = float(max_roe_map.get(bank, np.nan))
-                if np.isfinite(max_ann):
-                    if y_col == "ROE_delta_bp_Tot":
-                        # Total max scales with each row's Years (should be constant across the view).
-                        try:
-                            yrs = float(d["Years"].dropna().iloc[0])
-                        except Exception:
-                            yrs = float(years) if "years" in globals() else 1.0
-                        max_val = max_ann * yrs
-                    else:
-                        max_val = max_ann
-                    pot_vals = [max(max_val - float(v), 0.0) for v in cur_vals]
-                else:
-                    pot_vals = [0.0 for _ in cur_vals]
+                max_val = float(max_roe_map.get(bank, np.nan))
+                pot_vals = [max(max_val - float(v), 0.0) for v in cur_vals] if np.isfinite(max_val) else [0.0 for _ in cur_vals]
 
                 color = BANK_COLOR_MAP.get(bank)
 
-                # Filled bar = achieved ΔROE
                 fig.add_trace(
                     go.Bar(
                         name=bank,
@@ -2482,7 +2414,6 @@ with left_col:
                     )
                 )
 
-                # Outline bar (stacked on top of the achieved value) = remaining potential up to max-capacity
                 fig.add_trace(
                     go.Bar(
                         name=f"{bank} (potential)",
@@ -2496,15 +2427,8 @@ with left_col:
                         offsetgroup=bank,
                         legendgroup=bank,
                         showlegend=False,
-                        hovertemplate=(
-                            "Scenario=%{x}<br>"
-                            + "Potential to max=%{y:.1f}<br>"
-                            + "<extra></extra>"
-                        ),
                     )
                 )
-
-            # Single legend entry explaining the outline
 
             fig.add_trace(
                 go.Scatter(
@@ -2519,7 +2443,7 @@ with left_col:
 
             fig.update_layout(
                 barmode="group",
-                title=title,
+                title="ΔROE (bp p.a.) – Banks (transition-based)",
                 legend_title_text="Bank",
                 legend_orientation="v",
                 legend_yanchor="top",
@@ -2527,41 +2451,22 @@ with left_col:
                 legend_xanchor="left",
                 legend_x=1.02,
             )
-            fig.update_yaxes(title_text=y_label)
+            fig.update_yaxes(title_text="ΔROE (bp p.a.)")
             fig.update_xaxes(title_text="")
             return fig
 
-        with tab_annual:
-            fig2_yr = _plot_roe(
-                y_col="ROE_delta_bp",
-                y_label="ΔROE (bp p.a.)",
-                title="ΔROE (bp p.a.) – Banks (transition-based)",
-            )
-            st.plotly_chart(fig2_yr, use_container_width=True)
-
-        with tab_total:
-            fig2_tot = _plot_roe(
-                y_col="ROE_delta_bp_Tot",
-                y_label="Cumulative ΔROE (bp over horizon)",
-                title="Cumulative ΔROE (bp over horizon) – Banks (transition-based)",
-            )
-            st.plotly_chart(fig2_tot, use_container_width=True)
+        st.plotly_chart(_plot_roe_annual(), use_container_width=True)
 
     bottom_left, bottom_right = st.columns(2, gap="large")
 
     with bottom_left:
         st.subheader("3) Total Asset Offload")
 
-        # Two views: total over horizon vs annual (per year)
-        tab_annual, tab_total = st.tabs(["Annual (per year)", "Total (over horizon)"])
-
-        # Use ROE-augmented dataframe for transition-based offload metrics when available
+        # Annual view only (steady-state; no time horizon)
         offload_df = sim_df  # contains transition-based offload columns via _attach_transition_based_assets
 
         # Defensive: ensure required transition-based offload columns exist and are numeric
         _off_cols = [
-            "Assets_Offloaded_CET1_Transition_EUR_bn_Tot",
-            "Assets_Offloaded_ROE_Transition_EUR_bn_Tot",
             "Assets_Offloaded_CET1_Transition_EUR_bn_Yr",
             "Assets_Offloaded_ROE_Transition_EUR_bn_Yr",
         ]
@@ -2572,7 +2477,6 @@ with left_col:
                 offload_df[_c] = pd.to_numeric(offload_df[_c], errors="coerce").fillna(0.0)
 
         def _num0(x) -> float:
-            """Safe numeric cast; returns 0.0 for None/NaN/non-numeric."""
             try:
                 v = float(x)
             except Exception:
@@ -2580,8 +2484,6 @@ with left_col:
             return float(v) if np.isfinite(v) else 0.0
 
         def _build_offload_fig(df: pd.DataFrame, yv_cet1: str, yv_roe: str, y_label: str, title: str):
-            # Solid bars   = assets offloaded to achieve the CET1-uplift (Step "CET1")
-            # Transparent  = additional assets offloaded to achieve the ROE-uplift (Step "REDEPLOY")
             fig = go.Figure()
             scenarios_order = df["Scenario"].astype(str).dropna().unique().tolist()
 
@@ -2630,32 +2532,22 @@ with left_col:
                 legend_y=1,
                 legend_xanchor="left",
                 legend_x=1.02,
-            )
+)
             fig.update_yaxes(title_text=y_label)
             fig.update_xaxes(title_text="")
             return fig
 
-        with tab_total:
-            fig1_tot = _build_offload_fig(
-                offload_df,
-                yv_cet1="Assets_Offloaded_CET1_Transition_EUR_bn_Tot",
-                yv_roe="Assets_Offloaded_ROE_Transition_EUR_bn_Tot",
-                y_label="Assets offloaded (EUR bn, total, transition-based)",
-                title="Required offload (transition-based assets): CET1 + ROE split (total over horizon)",
-            )
-            st.plotly_chart(fig1_tot, use_container_width=True)
-
-        with tab_annual:
-            fig1_yr = _build_offload_fig(
-                offload_df,
-                yv_cet1="Assets_Offloaded_CET1_Transition_EUR_bn_Yr",
-                yv_roe="Assets_Offloaded_ROE_Transition_EUR_bn_Yr",
-                y_label="Assets offloaded (EUR bn p.a., transition-based)",
-                title="Required offload (transition-based assets): CET1 + ROE split (annual)",
-            )
-            st.plotly_chart(fig1_yr, use_container_width=True)
+        fig1_yr = _build_offload_fig(
+            offload_df,
+            yv_cet1="Assets_Offloaded_CET1_Transition_EUR_bn_Yr",
+            yv_roe="Assets_Offloaded_ROE_Transition_EUR_bn_Yr",
+            y_label="Assets offloaded (EUR bn p.a., transition-based)",
+            title="Required offload (transition-based assets): CET1 + ROE split (annual)",
+        )
+        st.plotly_chart(fig1_yr, use_container_width=True)
 
     with bottom_right:
+
         st.markdown("### 4) Donor utilization – share of eligible donor flow used")
         st.markdown(
             "<div style='color: #666666; font-size: 0.9rem; margin-top: -6px; margin-bottom: 12px;'>"
@@ -2677,7 +2569,7 @@ with left_col:
             alloc_f = pd.DataFrame()
         # Keep only combinations that are currently in sim_df (defensive against stale audits)
         try:
-            key_cols = ["Scenario", "SRT_Efficiency", "Bank", "Years"]
+            key_cols = ["Scenario", "SRT_Efficiency", "Bank"]
             if all(c in alloc_f.columns for c in key_cols) and all(c in sim_df.columns for c in key_cols):
                 _keys = sim_df[key_cols].drop_duplicates()
                 alloc_f = alloc_f.merge(_keys, on=key_cols, how="inner")
@@ -2729,9 +2621,6 @@ with left_col:
         # Exposure_CET1 / Exposure_REDEPLOY are per-year usage. For utilization and the capacity indicator we want
         # TOTAL usage over the horizon vs the eligible STOCK pool.
         denom = donor_util["Eligible_Exposure_EUR_bn"].replace(0.0, np.nan)
-
-        yrs_i = float(years) if "years" in globals() else 1.0
-        yrs_i = max(1.0, yrs_i)
 
         donor_util["Util_CET1_pct"] = 100.0 * donor_util["Exposure_CET1"] / denom
         donor_util["Util_REDEPLOY_pct"] = 100.0 * donor_util["Exposure_REDEPLOY"] / denom
@@ -2931,8 +2820,8 @@ with left_col:
                     .sum()
                     .unstack(fill_value=0.0)
                 )
-                rwa_cet1_tot = by_step.get("CET1", 0.0) * float(years)
-                rwa_roe_tot = by_step.get("REDEPLOY", 0.0) * float(years)
+                rwa_cet1_tot = by_step.get("CET1", 0.0) 
+                rwa_roe_tot = by_step.get("REDEPLOY", 0.0) 
                 rwa_sum_map = (rwa_cet1_tot + rwa_roe_tot).to_dict()
                 donor_tbl["RWA freed (EUR bn)"] = donor_tbl["Bank"].map(rwa_sum_map).round(0).astype("Int64").astype("Int64")
             else:
@@ -2964,29 +2853,29 @@ with left_col:
         "Scenario",
         "SRT_Efficiency",
         "Bank",
-        "Assets_Offloaded_CET1_Transition_EUR_bn_Tot",
-        "Assets_Offloaded_ROE_Transition_EUR_bn_Tot",
+        "Assets_Offloaded_CET1_Transition_EUR_bn_Yr",
+        "Assets_Offloaded_ROE_Transition_EUR_bn_Yr",
     ]
     # Robust to older / partial sim_df schemas: missing transition-based columns are created as NaN then filled with 0.0
     _tmp_port = sim_df.reindex(columns=_cols_port).copy()
-    for _c in ["Assets_Offloaded_CET1_Transition_EUR_bn_Tot", "Assets_Offloaded_ROE_Transition_EUR_bn_Tot"]:
+    for _c in ["Assets_Offloaded_CET1_Transition_EUR_bn_Yr", "Assets_Offloaded_ROE_Transition_EUR_bn_Yr"]:
         _tmp_port[_c] = pd.to_numeric(_tmp_port[_c], errors="coerce").fillna(0.0)
 
     port_base = (
         _tmp_port.groupby(["Scenario", "SRT_Efficiency"], as_index=False)[
-            ["Assets_Offloaded_CET1_Transition_EUR_bn_Tot", "Assets_Offloaded_ROE_Transition_EUR_bn_Tot"]
+            ["Assets_Offloaded_CET1_Transition_EUR_bn_Yr", "Assets_Offloaded_ROE_Transition_EUR_bn_Yr"]
         ].sum()
     )
 
     port_long = port_base.melt(
         id_vars=["Scenario", "SRT_Efficiency"],
-        value_vars=["Assets_Offloaded_CET1_Transition_EUR_bn_Tot", "Assets_Offloaded_ROE_Transition_EUR_bn_Tot"],
+        value_vars=["Assets_Offloaded_CET1_Transition_EUR_bn_Yr", "Assets_Offloaded_ROE_Transition_EUR_bn_Yr"],
         var_name="Component",
         value_name="Assets_offloaded_EUR_bn",
     )
     port_long["Component"] = port_long["Component"].map({
-        "Assets_Offloaded_CET1_Transition_EUR_bn_Tot": "CET1-uplift",
-        "Assets_Offloaded_ROE_Transition_EUR_bn_Tot": "ROE-uplift",
+        "Assets_Offloaded_CET1_Transition_EUR_bn_Yr": "CET1-uplift",
+        "Assets_Offloaded_ROE_Transition_EUR_bn_Yr": "ROE-uplift",
     })
     # Ensure one bar per Scenario/Component/(SRT_Efficiency) so Plotly can stack reliably
     port_long = (
