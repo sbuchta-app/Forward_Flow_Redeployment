@@ -24,34 +24,20 @@ import plotly.graph_objects as go
 B1_DONORS = ['B1_SME_CORE', 'B1_MIDCORP_CORE', 'B1_TRADE_FIN_CORE', 'B1_CRE_CORE', 'B1_CONSUMER_FIN_CORE']
 B2_RECEIVERS = ['B2_SME_RISK_UP', 'B2_MIDCORP_RISK_UP', 'B2_STRUCTURED_WC', 'B2_CRE_RISK_UP', 'B2_SPECIALTY_ABL']
 
-# ΔRWA density (pp) for B (negative = reduces RWAs per unit of exposure)
-DELTA_RWA_PP_B: Dict[Tuple[str, str], float] = {
-    ('B1_SME_CORE', 'B2_SME_RISK_UP'): -1.333,
-    ('B1_SME_CORE', 'B2_MIDCORP_RISK_UP'): -1.667,
-    ('B1_SME_CORE', 'B2_STRUCTURED_WC'): -3.000,
-    ('B1_SME_CORE', 'B2_CRE_RISK_UP'): -2.000,
-    ('B1_MIDCORP_CORE', 'B2_SME_RISK_UP'): -1.333,
-    ('B1_MIDCORP_CORE', 'B2_MIDCORP_RISK_UP'): -1.333,
-    ('B1_MIDCORP_CORE', 'B2_STRUCTURED_WC'): -2.333,
-    ('B1_MIDCORP_CORE', 'B2_CRE_RISK_UP'): -1.333,
-    ('B1_MIDCORP_CORE', 'B2_SPECIALTY_ABL'): -1.667,
-    ('B1_TRADE_FIN_CORE', 'B2_MIDCORP_RISK_UP'): -1.500,
-    ('B1_TRADE_FIN_CORE', 'B2_STRUCTURED_WC'): -1.200,
-    ('B1_CRE_CORE', 'B2_MIDCORP_RISK_UP'): -1.200,
-    ('B1_CRE_CORE', 'B2_STRUCTURED_WC'): -1.800,
-    ('B1_CRE_CORE', 'B2_CRE_RISK_UP'): -1.100,
-    ('B1_CONSUMER_FIN_CORE', 'B2_SME_RISK_UP'): -1.200,
-    ('B1_CONSUMER_FIN_CORE', 'B2_MIDCORP_RISK_UP'): -1.333,
-    ('B1_SME_CORE', 'B2_SPECIALTY_ABL'): -1.500,
-    ('B1_TRADE_FIN_CORE', 'B2_SME_RISK_UP'): -1.400,
-    ('B1_TRADE_FIN_CORE', 'B2_CRE_RISK_UP'): -1.100,
-    ('B1_TRADE_FIN_CORE', 'B2_SPECIALTY_ABL'): -1.300,
-    ('B1_CRE_CORE', 'B2_SME_RISK_UP'): -1.200,
-    ('B1_CRE_CORE', 'B2_SPECIALTY_ABL'): -1.300,
 
+# Allowed receiver buckets per donor (drives eligibility; UI enforces the same constraint)
+ALLOWED_RECEIVERS_BY_DONOR: Dict[str, set] = {
+    # SME core: allow all receivers
+    "B1_SME_CORE": set(B2_RECEIVERS),
+    # Mid-corp core: allow all receivers
+    "B1_MIDCORP_CORE": set(B2_RECEIVERS),
+    # Trade finance core: allow all receivers
+    "B1_TRADE_FIN_CORE": set(B2_RECEIVERS),
+    # CRE core: allow all receivers
+    "B1_CRE_CORE": set(B2_RECEIVERS),
+    # Consumer finance core: allow all receivers (no hard disablement)
+    "B1_CONSUMER_FIN_CORE": set(B2_RECEIVERS),
 }
-
-
 
 # ΔNet spread (bps) for B (positive = increases net margin)
 DELTA_SPREAD_BPS_B: Dict[Tuple[str, str], float] = {
@@ -150,10 +136,42 @@ RECEIVER_RISK_WEIGHT: Dict[str, float] = {
 }
 
 
+
+def transition_eligibility_product(
+    donor: str,
+    receiver: str,
+    *,
+    donor_net_margin_bps_by_b1: Dict[str, float] = DONOR_ABS_NET_SPREAD_BPS_BY_B1,
+    receiver_net_margin_bps_by_b2: Dict[str, float] = ABS_NET_SPREAD_BPS_BY_B2,
+    donor_risk_weight_by_b1: Dict[str, float] = DONOR_RISK_WEIGHT,
+) -> float:
+    """Eligibility product used to decide whether a donor -> receiver transition is selectable.
+
+    Steps (as specified):
+      1) receiver_net_margin / donor_net_margin
+      2) donor_risk_weight / receiver_net_margin
+      3) product = step1 * step2
+      4) eligible if product > 0
+
+    Notes:
+      - Net margins are taken from the absolute net spread calibration (bps).
+      - If any required denominator is 0 (or missing), the product is treated as 0 (non-eligible).
+    """
+    donor_nm = float(donor_net_margin_bps_by_b1.get(donor, 0.0) or 0.0)
+    recv_nm = float(receiver_net_margin_bps_by_b2.get(receiver, 0.0) or 0.0)
+    donor_rw = float(donor_risk_weight_by_b1.get(donor, 0.0) or 0.0)
+
+    if donor_nm == 0.0 or recv_nm == 0.0:
+        return 0.0
+
+    q1 = recv_nm / donor_nm
+    q2 = donor_rw / recv_nm
+    return q1 * q2
+
+
 def _eligible_cells_by_donor(
     donors: List[str],
     sale_share: float,
-    delta_rwa_pp: Dict[Tuple[str, str], float],
     delta_spread_bps: Dict[Tuple[str, str], float],
     retained_risk_dec: float = 0.0,
     donor_roll_pct_by_donor: Optional[Dict[str, float]] = None,
@@ -161,65 +179,73 @@ def _eligible_cells_by_donor(
 ) -> Dict[str, List[Cell]]:
     """Return all *eligible* receiver cells per donor.
 
-    Eligibility is controlled by receiver_split_by_donor (share>0).
+    **Eligibility** is controlled purely by `receiver_split_by_donor` (share > 0),
+    subject to the hard guardrails in `ALLOWED_RECEIVERS_BY_DONOR`.
 
-    Note: We do **no prioritization** across receivers. Allocation will split
-    a donor's used exposure equally across all eligible receivers.
+    We still compute `delta_s_eff_dec` and `ratio` for reporting/auditing.
 
-    We still compute delta_s_eff_dec and ratio for reporting/auditing.
+    Key change:
+      - The legacy ΔRWA matrix (DELTA_RWA_PP_B) is no longer used.
+      - The RWA-efficiency factor used in the ROE math is the quotient:
+            donor_risk_weight / receiver_risk_weight
+        for each donor -> receiver transition.
     """
     cells: Dict[str, List[Cell]] = {d: [] for d in donors}
+
     sale_share = float(sale_share)
-
-    retained_risk_dec = float(retained_risk_dec or 0.0)
-
-    retained_risk_dec = max(min(retained_risk_dec, 1.0), 0.0)
-
+    retained_risk_dec = max(min(float(retained_risk_dec or 0.0), 1.0), 0.0)
     eff = sale_share * (1.0 - retained_risk_dec)
 
-    for (d, r), drwa in delta_rwa_pp.items():
-        if d not in donors:
-            continue
-
-        dspr = delta_spread_bps.get((d, r))
-        if dspr is None:
-            continue
-
+    for d in donors:
         donor_rw = float(DONOR_RISK_WEIGHT.get(d, 0.0))
-        receiver_rw = float(RECEIVER_RISK_WEIGHT.get(r, 0.0))
-        abs_spread_bps = float(ABS_NET_SPREAD_BPS_BY_B2.get(r, 0.0))
-
-        if donor_rw <= 0 or receiver_rw <= 0:
+        if donor_rw <= 0:
             continue
 
-        # Eligibility gate: only include receivers with positive user-defined split (if provided).
-        if receiver_split_by_donor is not None:
-            if float(receiver_split_by_donor.get(d, {}).get(r, 0.0) or 0.0) <= 0.0:
+        allowed_receivers = ALLOWED_RECEIVERS_BY_DONOR.get(d, set(B2_RECEIVERS))
+        for r in allowed_receivers:
+            receiver_rw = float(RECEIVER_RISK_WEIGHT.get(r, 0.0))
+            if receiver_rw <= 0:
                 continue
 
-        # delta_rwa_density stays "as-is" (you use quotient-like values)
-        delta_rwa_density = (-float(drwa))
+            # Eligibility gate:
+            #   - transition must have a positive eligibility product (per user rule-set)
+            #   - and (if provided) the user-defined receiver split must be > 0
+            if transition_eligibility_product(d, r) <= 0.0:
+                continue
+            if receiver_split_by_donor is not None:
+                if float(receiver_split_by_donor.get(d, {}).get(r, 0.0) or 0.0) <= 0.0:
+                    continue
 
-        # economics term: redeployment value per freed RWA
-        # (keeps legacy structure: value scales with RWA density gain and receiver spread)
-        delta_s_eff_bps = delta_rwa_density * eff * abs_spread_bps
-        delta_s_eff_dec = delta_s_eff_bps / 10000.0
+            # Need spread calibration for reporting/profit computations
+            dspr = delta_spread_bps.get((d, r))
+            if dspr is None:
+                continue
 
-        rwa_red_per_eur = donor_rw * eff
-        ratio = (delta_s_eff_dec / rwa_red_per_eur) if rwa_red_per_eur > 0 else 0.0
+            abs_spread_bps = float(ABS_NET_SPREAD_BPS_BY_B2.get(r, 0.0))
 
-        cells[d].append(
-            Cell(
-                donor=d,
-                receiver=r,
-                delta_rwa_pp=float(drwa),
-                donor_risk_weight=donor_rw,
-                receiver_risk_weight=receiver_rw,
-                abs_net_spread_bps=abs_spread_bps,
-                delta_s_eff_dec=float(delta_s_eff_dec),
-                ratio=float(ratio),
+            # RWA-efficiency factor (replaces DELTA_RWA_PP_B usage)
+            delta_rwa_density = donor_rw / receiver_rw
+
+            # Economics term: redeployment value proxy (keeps legacy structure: scales with
+            # RWA-efficiency factor, net relief efficiency and receiver absolute spread)
+            delta_s_eff_bps = delta_rwa_density * eff * abs_spread_bps
+            delta_s_eff_dec = delta_s_eff_bps / 10000.0
+
+            rwa_red_per_eur = donor_rw * eff
+            ratio = (delta_s_eff_dec / rwa_red_per_eur) if rwa_red_per_eur > 0 else 0.0
+
+            cells[d].append(
+                Cell(
+                    donor=d,
+                    receiver=r,
+                    delta_rwa_pp=float("nan"),  # legacy field retained for schema compatibility
+                    donor_risk_weight=donor_rw,
+                    receiver_risk_weight=receiver_rw,
+                    abs_net_spread_bps=abs_spread_bps,
+                    delta_s_eff_dec=float(delta_s_eff_dec),
+                    ratio=float(ratio),
+                )
             )
-        )
 
     # drop donors with no eligible receivers
     return {d: lst for d, lst in cells.items() if lst}
@@ -250,7 +276,6 @@ def allocate_rwa_reduction_equal_receivers(
     cells_by_donor = _eligible_cells_by_donor(
         donors=donors,
         sale_share=float(sale_share),
-        delta_rwa_pp=DELTA_RWA_PP_B,
         delta_spread_bps=DELTA_SPREAD_BPS_B,
         retained_risk_dec=retained_risk_dec,
         donor_roll_pct_by_donor=donor_roll_pct_by_donor,
@@ -415,7 +440,6 @@ def allocate_until_profit_target(
     cells_by_donor = _eligible_cells_by_donor(
         donors=donors,
         sale_share=float(sale_share),
-        delta_rwa_pp=DELTA_RWA_PP_B,
         delta_spread_bps=DELTA_SPREAD_BPS_B,
         retained_risk_dec=retained_risk_dec,
         donor_roll_pct_by_donor=donor_roll_pct_by_donor,
@@ -1523,7 +1547,7 @@ import itertools
 # Implementation note: CSS targeting Streamlit's generated DOM can be brittle across versions.
 # We therefore insert two narrow "separator" columns between the three control columns.
 
-_SEPARATOR_STYLE = "border-left: 1px solid rgba(49, 51, 63, 0.20); height: 950px; margin: 0 auto;"
+_SEPARATOR_STYLE = "border-left: 1px solid rgba(49, 51, 63, 0.20); height: 1300px; margin: 0 auto;"
 
 def _draw_vsep():
     # Large height ensures the line spans the full height of the controls area.
@@ -1683,7 +1707,7 @@ gain_on_sale_bps = 50
 servicing_fee_bps = 20
 origination_fee_bps = 0
 retained_risk_pct = 0
-receiver_split_by_donor = None
+receiver_split_by_donor = {}
 
 
 with _tc2:
@@ -1693,7 +1717,7 @@ with _tc2:
         "Sold share of eligible flow (%)" ,
         min_value=10,
         max_value=95,
-        value=60,
+        value=70,
         step=1,
         help="Of the annual eligible (rolling) flow, the fraction that is sold to the strategic partner (whole-loan forward flow). The bank retains the remainder.",
         key="sale_share_slider",
@@ -1714,7 +1738,7 @@ with _tc2:
         "Gain-on-sale (bps, on sold flow)",
         min_value=0,
         max_value=200,
-        value=50,
+        value=100,
         step=1,
         help="Upfront pricing margin on the sold loans (positive = sold above par; negative = sold below par). Modeled as bps on the sold flow.",
         key="gain_on_sale_bps_slider",
@@ -1772,10 +1796,10 @@ with _tc3:
 
     st.markdown("### Receiver split per donor")
     st.caption(
-        "Choose how each donor bucket is split across receiver portfolios. "
-        "All receivers are available for every donor; transitions are considered *eligible* if their share is > 0. "
-        "Rows are normalized to 100% when the row sum is > 0."
-    )
+    "Choose how each donor bucket is split across receiver portfolios. "
+    "Within the hard guardrails, a cell is selectable only if the eligibility product (margin / risk-weight rule) is positive. "
+    "Each donor row should sum to 100%; rows that do not sum to 100% are treated as invalid (no flow allocated) until corrected."
+)
 
     def _bucket_label(x: str) -> str:
         s = str(x)
@@ -1818,89 +1842,157 @@ with _tc3:
         "B1_TRADE_FIN_CORE": set(B2_RECEIVERS),
         # CRE core: allow all receivers (as requested)
         "B1_CRE_CORE": set(B2_RECEIVERS),
-        # Consumer finance core: allow only SME and Mid-corp risk-up
-        "B1_CONSUMER_FIN_CORE": {"B2_SME_RISK_UP", "B2_MIDCORP_RISK_UP"},
+        # Consumer finance core: allow all receivers (no hard disablement)
+        "B1_CONSUMER_FIN_CORE": set(B2_RECEIVERS),
     }
-
-
-    # Default: equal split across all receivers (can be overridden by session state / user edits)
+    
+    # Persisted user-controlled section: "Receiver split per donor"
+    # - Eligibility is determined by:
+    #     (a) hard allow-list (_ALLOWED_RECEIVERS_BY_DONOR) AND
+    #     (b) transition_eligibility_product(donor, receiver) > 0 (finite).
+    # - Non-eligible cells are greyed out and forced to 0.
+    # - Row-sum constraint: for each donor, values across *eligible* receivers are forced to sum to 100%.
+    #   Implemented by making the last eligible receiver a computed "remainder to 100%" cell (disabled input).
+    
+    # Compute eligible receiver sets per donor (intersection of hard-guardrails and eligibility product)
+    _ELIGIBLE_BY_DONOR: Dict[str, set] = {}
+    for _d in B1_DONORS:
+        _elig = set()
+        for _r in B2_RECEIVERS:
+            if _r not in _ALLOWED_RECEIVERS_BY_DONOR.get(_d, set()):
+                continue
+            try:
+                prod = float(transition_eligibility_product(_d, _r))
+            except Exception:
+                prod = float("nan")
+            if np.isfinite(prod) and prod > 0.0:
+                _elig.add(_r)
+        _ELIGIBLE_BY_DONOR[_d] = _elig
+    
+    # Default: equal split across eligible receivers (last eligible receiver will be the remainder)
     if "receiver_split_pivot" not in st.session_state:
         _rows = []
         for _d in B1_DONORS:
+            elig = [r for r in B2_RECEIVERS if r in _ELIGIBLE_BY_DONOR.get(_d, set())]
+            n_elig = len(elig)
             row = {"Donor": _donor_labels[_d], "_donor_id": _d}
             for _r in B2_RECEIVERS:
-                row[_recv_labels[_r]] = (100.0 / float(len(_ALLOWED_RECEIVERS_BY_DONOR.get(_d, set())))) if (_r in _ALLOWED_RECEIVERS_BY_DONOR.get(_d, set())) and len(_ALLOWED_RECEIVERS_BY_DONOR.get(_d, set()))>0 else 0.0
+                row[_recv_labels[_r]] = 0.0
+            if n_elig > 0:
+                base = 100.0 / float(n_elig)
+                for _r in elig[:-1]:
+                    row[_recv_labels[_r]] = base
+                row[_recv_labels[elig[-1]]] = 100.0 - base * float(max(n_elig - 1, 0))
             _rows.append(row)
         st.session_state["receiver_split_pivot"] = pd.DataFrame(_rows)
-
+    
     _cur = st.session_state["receiver_split_pivot"].copy()
-
-    # Render editable grid (number inputs) and build normalized split dict for the allocator
+    
+    # Render editable grid (number inputs) and build split dict for the allocator
     receiver_split_by_donor: Dict[str, Dict[str, float]] = {}
-    _normalized_rows = []
-
+    _rows_out = []
+    
     _hcols = st.columns([1.4] + [1.0] * len(B2_RECEIVERS), gap="small")
     _hcols[0].markdown("**Donor**")
     for j, _r in enumerate(B2_RECEIVERS, start=1):
         _hcols[j].markdown(f"**{_recv_labels[_r]}**")
-
+    
     for _d in B1_DONORS:
+        elig_set = _ELIGIBLE_BY_DONOR.get(_d, set())
+        elig = [r for r in B2_RECEIVERS if r in elig_set]
+    
+        # Choose remainder cell: prefer the last receiver in the global order if eligible; otherwise last eligible.
+        remainder_r = (
+            (B2_RECEIVERS[-1] if (B2_RECEIVERS and B2_RECEIVERS[-1] in elig_set) else (elig[-1] if len(elig) > 0 else None))
+        )
+    
         _rcols = st.columns([1.4] + [1.0] * len(B2_RECEIVERS), gap="small")
         _rcols[0].markdown(_donor_labels[_d])
-
-        vals = {}
-        row_sum = 0.0
-
+    
+        vals_pct: Dict[str, float] = {r: 0.0 for r in B2_RECEIVERS}
+        running = 0.0  # running sum across eligible receivers except remainder
+    
         for j, _r in enumerate(B2_RECEIVERS, start=1):
             col = _recv_labels[_r]
+    
             # Pull previous value if present
             try:
                 prev = float(_cur.loc[_cur["_donor_id"] == _d, col].iloc[0])
             except Exception:
                 prev = 0.0
-
-            if _r not in _ALLOWED_RECEIVERS_BY_DONOR.get(_d, set()):
-                prev = 0.0
-
-            if _r not in _ALLOWED_RECEIVERS_BY_DONOR.get(_d, set()):
-                # Disallowed transition: fixed 0 and not editable
-                v = _rcols[j].number_input(
+    
+            # Non-eligible transition: fixed 0 and not editable
+            if _r not in elig_set:
+                _k = f"receiver_split_{_d}_{_r}"
+                st.session_state[_k] = 0.0
+                _rcols[j].number_input(
                     label="",
                     min_value=0.0,
                     max_value=0.0,
                     value=0.0,
                     step=1.0,
-                    key=f"receiver_split_{_d}_{_r}",
+                    key=_k,
                     disabled=True,
                 )
-            else:
-                v = _rcols[j].number_input(
+                vals_pct[_r] = 0.0
+                continue
+    
+            # Remainder cell (last eligible receiver): computed and disabled
+            if remainder_r is not None and _r == remainder_r:
+                rem = 100.0 - running
+                if not np.isfinite(rem):
+                    rem = 0.0
+                rem = float(max(0.0, min(100.0, rem)))
+    
+                _k = f"receiver_split_{_d}_{_r}"
+                st.session_state[_k] = float(rem)
+    
+                _rcols[j].number_input(
                     label="",
                     min_value=0.0,
                     max_value=100.0,
-                    value=float(prev),
+                    value=float(rem),
                     step=1.0,
-                    key=f"receiver_split_{_d}_{_r}",
+                    key=_k,
+                    disabled=True,
+                    help="Remainder to 100% (computed).",
                 )
+                vals_pct[_r] = rem
+                continue
+    
+            # Editable eligible cell: cap input so row sum can never exceed 100
+            remaining = 100.0 - running
+            if not np.isfinite(remaining):
+                remaining = 100.0
+            remaining = float(max(0.0, min(100.0, remaining)))
+    
+            v = _rcols[j].number_input(
+                label="",
+                min_value=0.0,
+                max_value=float(remaining),
+                value=float(max(0.0, min(prev, remaining))),
+                step=1.0,
+                key=f"receiver_split_{_d}_{_r}",
+            )
             v = float(v or 0.0)
-            vals[_r] = max(0.0, v)
-            row_sum += max(0.0, v)
-
-        # Normalize to sum=1 for the allocator; eligibility = share>0
+            v = float(max(0.0, min(v, remaining)))
+            vals_pct[_r] = v
+            running += v
+    
+        # Build allocator weights: fractions summing to 1 across eligible receivers (if any)
+        row_sum = float(sum(vals_pct[r] for r in elig)) if elig else 0.0
         if row_sum > 0:
-            receiver_split_by_donor[_d] = {r: (v / row_sum) for r, v in vals.items() if v > 0}
-            norm_vals_pct = {r: (v / row_sum) * 100.0 for r, v in vals.items()}
+            receiver_split_by_donor[_d] = {r: (vals_pct[r] / row_sum) for r in elig if vals_pct[r] > 0}
         else:
             receiver_split_by_donor[_d] = {}
-            norm_vals_pct = {r: 0.0 for r in vals.keys()}
-
-        norm_row = {"Donor": _donor_labels[_d], "_donor_id": _d}
+    
+        # Persist the displayed percentages (including remainder)
+        out_row = {"Donor": _donor_labels[_d], "_donor_id": _d}
         for _r in B2_RECEIVERS:
-            norm_row[_recv_labels[_r]] = float(norm_vals_pct.get(_r, 0.0))
-        _normalized_rows.append(norm_row)
-
-    # Persist normalized values (so UI stays stable after reruns)
-    st.session_state["receiver_split_pivot"] = pd.DataFrame(_normalized_rows)
+            out_row[_recv_labels[_r]] = float(vals_pct.get(_r, 0.0))
+        _rows_out.append(out_row)
+    
+    st.session_state["receiver_split_pivot"] = pd.DataFrame(_rows_out)
 
 # donor_roll_pct is defined in Transition engine controls (do not overwrite)
 
