@@ -121,9 +121,9 @@ class Allocation:
 DONOR_RISK_WEIGHT: Dict[str, float] = {
     # Updated donor risk weights per user calibration
     'B1_SME_CORE': 0.900,
-    'B1_MIDCORP_CORE': 0.800,
+    'B1_MIDCORP_CORE': 0.700,
     'B1_TRADE_FIN_CORE': 0.400,
-    'B1_CRE_CORE': 0.950,
+    'B1_CRE_CORE': 0.800,
     'B1_CONSUMER_FIN_CORE': 0.750,
 }
 
