@@ -1779,8 +1779,8 @@ with _tc3:
     st.markdown("**Rolling fraction of donor sub-portfolios (annual origination flow)**")
     st.caption("Steady-state flow assumption: each year, this % of each donor sub-portfolio is renewed by new business. The transition engine allocates *annual* flow; sold share applies to that flow.")
 
-    roll_sme = st.slider("Rolling fraction — SME core (% p.a.) - RW 90%", 0, 25, 15, 1, key="roll_sme")
-    roll_mid = st.slider("Rolling fraction — Mid-corp core (% p.a.) - RW 70%", 0, 25, 15, 1, key="roll_mid")
+    roll_sme = st.slider("Rolling fraction — SME core (% p.a.) - RW 85%", 0, 25, 15, 1, key="roll_sme")
+    roll_mid = st.slider("Rolling fraction — Mid-corp core (% p.a.) - RW 65%", 0, 25, 15, 1, key="roll_mid")
     roll_tf  = st.slider("Rolling fraction — Trade finance core (% p.a.) - RW 40%", 0, 25, 15, 1, key="roll_tf")
     roll_cre = st.slider("Rolling fraction — CRE core (% p.a.) - RW 80%", 0, 25, 15, 1, key="roll_cre")
     roll_cons = st.slider("Rolling fraction — Consumer finance core (% p.a.) - RW 75%", 0, 25, 15, 1, key="roll_cons")
